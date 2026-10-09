@@ -185,6 +185,12 @@ inline bool intersect(const Ray &r, double &t, int &id,int ignoreId = -1) {
 // n = normal
 // s = eje local X
 // t = eje local Y
+// esta funcion Construcción de la Base Ortonormal (u, v, w) y Transformación Global
+// tomando en cuenta lo siguiente:
+// u = s = eje local X
+// v = t = eje local Y
+// w = n = normal: osea el eje z
+//==============================================================
 void coordinateSystem(const Vector &n,Vector &s,Vector &t)
 {
     if (fabs(n.x) > fabs(n.y))
@@ -212,6 +218,12 @@ void coordinateSystem(const Vector &n,Vector &s,Vector &t)
 // Y = t
 // Z = n
 // Se utiliza muestreo ponderado por coseno.
+// en el cual la funcion randomHemisphereDirection() se encarga de generar una direccion aleatoria en el hemisferio
+// con las siguientes formulas:
+// cos(theta)=sqrt(1-r1) 
+// sin(theta)=sqrt(r1)
+// phi = 2*PI*r2
+// y r1,r2 son numeros aleatorios entre 0 y 1
 //==============================================================
 Vector randomHemisphereDirection(std::mt19937 &gen,std::uniform_real_distribution<double> &dis)
 {
@@ -219,9 +231,11 @@ Vector randomHemisphereDirection(std::mt19937 &gen,std::uniform_real_distributio
     double r2 = dis(gen);
 
     const double PI = 3.14159265358979323846;
-    double phi = 2.0 * PI * r1;
-    double cosTheta = sqrt(r2);
-    double sinTheta = sqrt(1.0 - r2);
+    double phi = 2.0 * PI * r2;
+    //double cosTheta = sqrt(r2);
+    //double sinTheta = sqrt(1.0 - r2);
+	double cosTheta = sqrt(1-r1);
+	double sinTheta = sqrt(r1);
 
     // Direccion LOCAL
     return Vector(cos(phi) * sinTheta,sin(phi) * sinTheta,cosTheta);
@@ -235,6 +249,8 @@ negro. Si existe una intersección, se obtiene la esfera mediante su índice id.
 1.- El punto de impacto se calcula con x = r.o + r.d * t. 
 2.- Después se obtiene la normal de la esfera en ese punto mediante (x - obj.p).normalize(). 
 3.- En la versión actual, la normal se calcula pero todavía no participa en el color final. Finalmente se devuelve obj.c, por lo que el objeto aparece con su color base sin iluminación.
+4.- Construir la base ortonormal local (u, v, w), es decir, Transforma la dirección aleatoria del espacio local al espacio global de la escena
+5.- Calcular la iluminación de Monte Carlo.
 */
 Color shade(const Ray &r,std::mt19937 &gen,std::uniform_real_distribution<double> &dis) {
 
@@ -250,6 +266,7 @@ Color shade(const Ray &r,std::mt19937 &gen,std::uniform_real_distribution<double
     const Sphere &obj = spheres[id];
 
 	// PROYECTO 2: nuevo
+	// Si el objeto golpeado es la fuente luminosa, devuelve lightEmission.Para cualquier otra superficie.
 	if (id == LIGHT_ID)
     {
         return lightEmission;
@@ -265,6 +282,9 @@ Color shade(const Ray &r,std::mt19937 &gen,std::uniform_real_distribution<double
 
 	// PROYECTO 2:
 	// crear sistema de coordenadas local
+	/* y ejecuta un ciclo de 64 muestras. En cada muestra se genera una dirección aleatoria, se transforma de local a global y se crea un rayo
+secundario desde x + n·1e-4. Este pequeño desplazamiento evita que el nuevo rayo vuelva a intersectar inmediatamente la misma superficie.
+	*/
 	Vector s;
     Vector t;
 
@@ -306,7 +326,10 @@ Color shade(const Ray &r,std::mt19937 &gen,std::uniform_real_distribution<double
 
 
         //------------------------------------------------------
-        // Buscar interseccion del rayo secundario
+        // Buscar interseccion del rayo secundario:
+		//Después se comprueba qué objeto alcanza el rayo secundario. Si alcanza la fuente luminosa, 
+		//se calcula la contribución como el producto elemento a elemento entre el color de la superficie y la emisión de la luz.
+		//Las contribuciones se acumulan y finalmente se dividen entre el número de muestras.
         //------------------------------------------------------
 
         double secondaryT;
@@ -383,6 +406,12 @@ int main(int argc, char *argv[]) {
 	Color *pixelColors = new Color[w * h];
 
 	// PROYECTO 2: usar openmp para paralelizar el ciclo: cada hilo computara un renglon (ciclo interior),
+	/*
+	El código utiliza OpenMP para distribuir el procesamiento de los renglones de la imagen entre varios hilos.
+Cada hilo crea su propio generador std::mt19937 utilizando una semilla dependiente de
+omp_get_thread_num(). Esto evita compartir el generador aleatorio entre hilos y reduce problemas de
+concurrencia.
+	*/
 	#pragma omp parallel
 	{
 		std::mt19937 gen(1234 + omp_get_thread_num() * 7919);
@@ -430,6 +459,7 @@ int main(int argc, char *argv[]) {
 
 	return 0;
 }
+
 
 
 
