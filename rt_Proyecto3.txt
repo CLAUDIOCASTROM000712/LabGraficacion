@@ -1,0 +1,577 @@
+// rt: un lanzador de rayos minimalista
+// g++ -O3 -fopenmp rt.cpp -o rt
+#include <math.h>
+#include <stdlib.h>
+#include <stdio.h>  
+#include <omp.h>
+#include <random> //para generar numeros aleatorios para el metodo de monte carlo
+
+class Vector 
+{
+public:        
+	double x, y, z; // coordenadas x,y,z 
+  
+	// Constructor del vector, parametros por default en cero
+	Vector(double x_= 0, double y_= 0, double z_= 0){ x=x_; y=y_; z=z_; }
+  
+	// operador para suma y resta de vectores
+	Vector operator+(const Vector &b) const { return Vector(x + b.x, y + b.y, z + b.z); }
+	Vector operator-(const Vector &b) const { return Vector(x - b.x, y - b.y, z - b.z); }
+	// operator multiplicacion vector y escalar 
+	Vector operator*(double b) const { return Vector(x * b, y * b, z * b); }
+  
+	// operator % para producto cruz
+	Vector operator%(const Vector &b) const { return Vector(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x); }
+	
+	// producto punto con vector b
+	double dot(const Vector &b) const { return x * b.x + y * b.y + z * b.z; }
+
+	// producto elemento a elemento (Hadamard product)
+	Vector mult(const Vector &b) const { return Vector(x * b.x, y * b.y, z * b.z); }
+	
+	// normalizar vector 
+	Vector& normalize(){ return *this = *this * (1.0 / sqrt(x * x + y * y + z * z)); }
+};
+typedef Vector Point;
+typedef Vector Color;
+
+/*
+Un rayo está formado por un origen o y una dirección d. El constructor recibe ambos valores. Matemáticamente,
+cualquier punto del rayo se expresa como r(t) = O + tD, donde t representa la distancia recorrida
+*/
+class Ray 
+{ 
+public:
+	Point o;
+	Vector d; // origen y direcccion del rayo
+	Ray(Point o_, Vector d_) : o(o_), d(d_) {} // constructor
+};
+
+class Sphere 
+{
+public:
+	double r;	// radio de la esfera
+	Point p;	// posicion
+	Color c;	// color  
+
+	Sphere(double r_, Point p_, Color c_): r(r_), p(p_), c(c_) {}
+  
+	// PROYECTO 1:
+	// determina si el rayo intersecta a esta esfera
+	double intersect(const Ray &ray) const {
+		// regresar distancia si hay intersección
+		// regresar 0.0 si no hay interseccion
+		Vector op = p-ray.o; //Calculamos el vector desde el origen del rayo hasta el centro de la esfera: op = P-O
+		double b = op.dot(ray.d); //se calcula el producto punto entre op y la dirección del rayo: b = op . D
+		double det = b*b - op.dot(op) + r*r; //es el discriminante de la ecuacion det = d*d - op*op + r*r
+		if(det < 0.0) // si el discriminante es negativo, no hay intersección, por lo que se retorna 0.0
+			return 0.0; //El rayo no toca la esfera.
+		
+		det = sqrt(det); //si existe la interseccion, entonces se calcula las posibles intersecciones t1 y t2:
+		/*tambien puede ocurrir:
+		t1 < 0
+		t2 > 0
+		por eso comprobamos el t2 por que Esto sucede cuando el origen del rayo está dentro de la esfera.
+		y se comprueba el t1 y t2
+		*/
+		double t1 = b - det;//t1 es la interseccion mas cercana
+    	double t2 = b + det;// Si t1 no sirve, probar la t2
+		if(t1 > 1e-4) //usamos 1e-4 para evitar intersecciones muy cercanas a 0
+			return t1;
+		if(t2 > 1e-4)
+			return t2;
+	
+
+		return 0.0; //no hay interseccion valida
+	}
+};
+
+/*
+el arreglo spheres[]:contiene las superficies de la escena. Las cinco primeras esferas tienen un radio enorme y
+funcionan como paredes: izquierda, derecha, fondo, suelo y techo. Esto crea una habitación. Después se agregan tres
+esferas pequeñas ubicadas dentro de ella. Sus colores se expresan con tres valores RGB en el rango aproximado de 0 a 1.
+*/
+Sphere spheres[] = {
+	//Escena: radio, posicion, color 
+	Sphere(1e5,  Point(-1e5 - 49, 0, 0),   Color(0.75, 0.25, 0.25)), // pared izq
+	Sphere(1e5,  Point(1e5 + 49, 0, 0),    Color(0.25, 0.25, 0.75)), // pared der
+	Sphere(1e5,  Point(0, 0, -1e5 - 81.6), Color(.50, .50, .50)), // pared detras
+	Sphere(1e5,  Point(0, -1e5 - 40.8, 0), Color(0.50, 0.50, 0.50)), // suelo
+	Sphere(1e5,  Point(0, 1e5 + 40.8, 0),  Color(0.50, 0.50, 0.50)), // techo
+	Sphere(16.5, Point(-23, -24.3, -34.6), Color(.999, .999, .999)), // esfera abajo-izq
+	Sphere(16.5, Point(23, -24.3, -3.6),   Color(.999, .999, .999) ), // esfera abajo-der
+	Sphere(10.5, Point(0, 24.3, 0),        Color(1, 1, 1)), // esfera arriba: sera nuestra fuente luminosa
+    //Sphere(10.5,Point(0,2,0),Color(1,1,1)) //nueva esfera luminosa
+	//Sphere(10.5, Point(0,-10,-2), 		   Color(1, 1, 0)) 
+};
+
+//==============================================================
+// Proyecto 2: CONFIGURACION DE LA FUENTE LUMINOSA
+//==============================================================
+
+// ID de la esfera que funciona como foco
+const int LIGHT_ID = 7;
+
+// Intensidad de la fuente luminosa
+Color lightEmission(25.0, 25.0, 25.0);
+
+// Numero de muestras Monte Carlo
+const int SAMPLES = 256;
+
+// Generador aleatorio compartido por todas las llamadas a randomHemisphereDirection().
+// Se usa thread_local para evitar races al paralelizar con OpenMP.
+static thread_local std::mt19937 gen(std::random_device{}());
+static thread_local std::uniform_real_distribution<double> dis(0.0, 1.0);
+
+//==============================================================================================================================================
+/*
+la funcion clamp() limita cada componente de color al intervalo [0,1]. Si un valor es menor que cero se convierte en 0 y si es
+mayor que uno se convierte en 1. 
+la funcion toDisplayValue() transforma posteriormente el valor a un entero entre 0 y 255 y
+aplica una corrección gamma aproximada de 2.2, adecuada para visualizar los colores en la imagen.
+*/
+inline double clamp(const double x) { 
+	if(x < 0.0)
+		return 0.0;
+	else if(x > 1.0)
+		return 1.0;
+	return x;
+}
+
+// convierte un valor de color en [0,1] a un entero en [0,255]
+inline int toDisplayValue(const double x) {
+	return int( pow( clamp(x), 1.0/2.2 ) * 255 + .5); 
+}
+//==============================================================================================================================================
+
+// PROYECTO 1
+// calcular la intersección del rayo r con todas las esferas
+// regresar true si hubo una intersección, falso de otro modo
+// almacenar en t la distancia sobre el rayo en que sucede la interseccion
+// almacenar en id el indice de spheres[] de la esfera cuya interseccion es mas cercana
+//int ignoreId = -1
+inline bool intersect(const Ray &r, double &t, int &id,int ignoreId = -1) {
+	double distance;
+    double closest = 1e20;
+
+    bool hit = false;
+
+    int numSpheres = sizeof(spheres) / sizeof(Sphere); // recorremos todas las esferas en la escena
+
+    for (int i = 0; i < numSpheres; i++) { //considerando 3 esferas.
+
+		if(i==ignoreId) // ignorar la esfera con el id especificado
+			continue;
+
+        distance = spheres[i].intersect(r);//probamos cada esfera
+
+        if (distance > 0.0 && distance < closest) {//eligo la esfera mas cercana a la camara
+
+            closest = distance;
+            id = i;
+            hit = true;
+        }
+    }
+
+    if (hit) {
+        t = closest;
+        return true;
+    }
+
+    return false;
+}
+
+//==============================================================
+// Proyecto 2: SISTEMA DE COORDENADAS LOCAL
+// n = normal
+// s = eje local X
+// t = eje local Y
+// esta funcion Construcción de la Base Ortonormal (u, v, w) y Transformación Global
+// tomando en cuenta lo siguiente:
+// u = s = eje local X
+// v = t = eje local Y
+// w = n = normal: osea el eje z
+//==============================================================
+void coordinateSystem(const Vector &n,Vector &s,Vector &t)
+{
+    if (fabs(n.x) > fabs(n.y))
+    {
+        double invLen = 1.0 / sqrt(n.x * n.x + n.z * n.z);
+        t = Vector(n.z * invLen,0.0,-n.x * invLen);
+    }
+    else
+    {
+        double invLen = 1.0 / sqrt(n.y * n.y + n.z * n.z);
+        t = Vector(0.0,n.z * invLen,-n.y * invLen);
+    }
+
+    // Producto cruz
+    s = t % n;
+
+    s.normalize();
+}
+
+//==============================================================
+// PROYECTO 2: GENERAR DIRECCION ALEATORIA EN EL HEMISFERIO
+//
+// La direccion se genera en coordenadas locales:
+// X = s
+// Y = t
+// Z = n
+// Se utiliza muestreo ponderado por coseno.
+// en el cual la funcion randomHemisphereDirection() se encarga de generar una direccion aleatoria en el hemisferio
+// con las siguientes formulas:
+// cos(theta)=sqrt(1-r1) 
+// sin(theta)=sqrt(r1)
+// phi = 2*PI*r2
+// y r1,r2 son numeros aleatorios entre 0 y 1
+//==============================================================
+Vector randomHemisphereDirection(std::mt19937 &gen,std::uniform_real_distribution<double> &dis)
+{
+    double r1 = dis(gen);
+    double r2 = dis(gen);
+
+    const double PI = 3.14159265358979323846;
+    double phi = 2.0 * PI * r2;
+    //double cosTheta = sqrt(r2);
+    //double sinTheta = sqrt(1.0 - r2);
+	double cosTheta = sqrt(1-r1);
+	double sinTheta = sqrt(r1);
+
+    // Direccion LOCAL
+    return Vector(cos(phi) * sinTheta,sin(phi) * sinTheta,cosTheta);
+}
+
+//==============================================================
+// Proyecto 3: generar un punto aleatorio sobre la superficie
+// de la esfera que funciona como fuente luminosa.
+// ¿Qué hace esta función?
+//1. Genera dos números aleatorios.
+//2. Los transforma en una dirección distribuida uniformemente sobre la esfera.
+//3. Multiplica la dirección por el radio de la fuente.
+//4. Suma el resultado al centro de la esfera para obtener el punto de muestreo.
+//A diferencia de la función anterior, esta no genera una dirección para iluminar el hemisferio receptor. Genera directamente una posición sobre la superficie de la luz.
+//==============================================================
+Point randomPointOnLight(const Sphere &light,std::mt19937 &gen,std::uniform_real_distribution<double> &dis)
+{
+    const double PI = 3.14159265358979323846;
+
+    // Números aleatorios entre 0 y 1
+    double u = dis(gen);
+    double v = dis(gen);
+
+    // Coordenadas esféricas uniformes
+    double z = 1.0 - 2.0 * u;
+    double phi = 2.0 * PI * v;
+    double rho = sqrt(1.0 - z * z);
+
+    // Dirección unitaria desde el centro de la esfera
+    Vector direction(
+        rho * cos(phi),
+        rho * sin(phi),
+        z
+    );
+
+    // Punto sobre la superficie de la fuente luminosa
+    return light.p + direction * light.r;
+}
+
+/*
+Calcula la iluminacion directa de un punto mediante muestreo Monte Carlo de la
+superficie de la fuente luminosa. Para cada muestra se evalua la geometria, los
+cosenos de las dos superficies y la visibilidad mediante un rayo de sombra.
+*/
+// ============================================================================
+// SHADING / CALCULO DE COLOR E ILUMINACION
+// Para el rayo de camara:
+//  1. Encuentra la primera superficie alcanzada.
+//  2. Si se alcanza la fuente luminosa, devuelve su emision.
+//  3. En otro caso, calcula el punto de impacto y su normal.
+//  4. Toma SAMPLES puntos de la superficie de la luz.
+//  5. Descarta muestras que no miran a la superficie receptora o cuya luz no
+//     llega a la superficie por su orientacion.
+//  6. Lanza un rayo de sombra para comprobar que la muestra es visible.
+//  7. Calcula la contribucion Lambertiana y promedia las muestras.
+//
+// Para una superficie difusa, la BRDF de Lambert es albedo/PI. El estimador
+// incluye cos(theta_superficie), cos(theta_luz), la distancia al cuadrado y
+// la PDF de area uniforme p_A = 1/(4*PI*r_luz^2).
+// ============================================================================
+Color shade(const Ray &r,std::mt19937 &gen,std::uniform_real_distribution<double> &dis) {
+
+    double thit;
+    int id = -1;
+
+	// determinar que esfera (id) y a que distancia (t) el rayo intersecta
+	// ¿El rayo golpeó alguna esfera?
+    if (!intersect(r, thit, id))
+        return Color();
+
+    // Obtener la esfera golpeada
+    const Sphere &obj = spheres[id];
+
+	// PROYECTO 2: nuevo
+	// Si el objeto golpeado es la fuente luminosa, devuelve lightEmission.Para cualquier otra superficie.
+	if (id == LIGHT_ID)
+    {
+        return lightEmission;
+    }
+
+	// PROYECTO 1
+	// determinar coordenadas del punto de interseccion
+    // Punto de intersección r(t) = O + t*D
+	//calculamos el punto de impacto y la normal
+    Point x = r.o + r.d * thit;
+
+    // determinar la dirección normal en el punto de interseccion
+    Vector n = (x - obj.p).normalize();
+
+	//==============================================================
+	//PROYECTO 3
+	// Obtener la fuente luminosa
+	// En el código anterior, la contribución de cada muestra se calcula mediante:
+	// Ci = fr * Le * cos_theta_x * cos_theta_y / (d^2) * (1/p_A)
+	//Donde:
+	//- fr: es la BRDF del material.
+	//- Le: es la emisión de la fuente luminosa.
+	//- cos_theta_x: representa la orientación de la superficie receptora.
+	//- cos_theta_y: representa la orientación de la fuente.
+	//- d: es la distancia entre la superficie y la muestra luminosa.
+	//- p_A: es la densidad de probabilidad del muestreo por unidad de área.
+	// para el material difuso de lambert:
+	// fr = albedo / PI
+	// en esta expresion, albedo es el color de la superficie (obj.c) y PI es la constante matemática pi.
+	// Como los puntos se distribuyen uniformemente sobre una esfera de radio(r), la densidad de probabilidad es:
+	// p_A = 1 / (4 * PI * r^2)
+	// Dividir la contribución entre esta PDF compensa el muestreo aleatorio y permite aproximar la integral de iluminación.
+	//Finalmente, el resultado se obtiene mediante:
+	//Lo(x) = (1/N) * sum(Ci) donde N son las muestras ejemplo N = 64,128,etc. y Ci es la contribución de cada muestra.
+	//==============================================================
+    //Muestreo explicito de la fuente de area: acumular solo muestras visibles.
+    const Sphere &light = spheres[LIGHT_ID];
+
+    const double PI = 3.14159265358979323846;
+
+    // Area de la superficie esferica de la fuente
+    // A = 4 * PI * r^2 que es el area de la esfera de radio r
+    double lightArea = 4.0 * PI * light.r * light.r;
+
+	// PDF de muestreo uniforme por unidad de area
+    double pdfArea = 1.0 / lightArea;
+
+    // Acumulador de iluminacion
+    Color accumulated(0.0, 0.0, 0.0);
+
+	// 3. MUESTREO EXPLICITO DE LA FUENTE LUMINOSA
+	for (int sample = 0; sample < SAMPLES; sample++)
+    {
+        // Seleccionar un punto aleatorio sobre la luz
+        Point y = randomPointOnLight(light, gen, dis);
+
+        // Origen del rayo de sombra.
+        // El epsilon evita autointersecciones.
+        Point shadowOrigin = x + n * 1e-4;
+       
+
+        // Vector desde el origen del rayo hasta la muestra
+        // Vector desde la superficie receptora hasta el punto de luz.
+        Vector toLight = y - shadowOrigin;
+        
+        // Distancia hasta la muestra luminosa
+        // Distancia euclidiana entre la superficie y muestra de luz o muestra luminosa.
+        double distance = sqrt(toLight.dot(toLight));
+
+        if (distance <= 1e-6)
+            continue;
+
+        // 4. Direccion unitaria hacia la muestra luminosa
+        Vector wi = toLight * (1.0 / distance);
+
+        // 5. Orientacion de la superficie receptora
+        // Coseno del angulo entre la normal receptora y la direccion a la luz.
+        double cosSurface = n.dot(wi);
+
+        // La superficie no recibe luz si la muestra
+        // se encuentra por debajo de su hemisferio visible.
+        // Si es cero o negativo, la muestra queda detras de la superficie.
+        if (cosSurface <= 0.0)
+            continue;
+
+        // Normal exterior de la fuente en el punto y
+        Vector lightNormal = (y - light.p).normalize();
+
+        // Orientacion de la fuente hacia la superficie
+        // Coseno del angulo de salida de la luz hacia el punto receptor.
+        double cosLight = lightNormal.dot(wi * -1.0);
+
+        // La esfera emite hacia su exterior.
+        // Si cosLight <= 0, esta muestra no aporta luz.
+        // Una esfera emisora solo aporta en su lado orientado hacia el receptor.
+        if (cosLight <= 0.0)
+            continue;
+
+        // 6. Comprobar visibilidad con un rayo de sombra
+        // aqui se construye el rayo de sombra desde el punto receptor hacia la luz.
+        Ray shadowRay(shadowOrigin, wi);
+       
+        double shadowT;
+        int shadowId = -1;
+
+        bool visible = false;
+        // La muestra solo puede contribuir si la primera interseccion del rayo
+        // de sombra corresponde a la esfera que representa la fuente luminosa.
+        bool hit = intersect(shadowRay, shadowT, shadowId, id);
+
+        if(!hit || shadowId != LIGHT_ID){
+            //continue;
+        }
+
+        // Comprobar que la intersección corresponde aproximadamente
+        // al punto muestreado y, no solo a la esfera luminosa.
+        // Verificar que la interseccion se encuentre aproximadamente a la
+        // distancia del punto muestreado. La tolerancia considera error numerico.
+        double tolerance = 1e-3 * (1.0 + distance);
+
+        if (fabs(shadowT - distance) > tolerance)
+            continue;
+       
+        //==================================================================================================
+        //esta parte del codigo valida si hay una visibilidad de interseccion de la sombra en la superficie.
+        /*if (intersect(shadowRay, shadowT, shadowId, id))
+        {
+            // La muestra es visible si el primer objeto
+            // alcanzado es la fuente luminosa y la
+            // interseccion corresponde al punto muestreado.
+            //
+            // La tolerancia evita problemas numericos.
+            double tolerance = 1e-3 * (1.0 + distance);
+
+            if (shadowId == LIGHT_ID &&
+                fabs(shadowT - distance) < tolerance)
+            {
+                visible = true;
+            }
+        }*/
+        //==================================================================================================
+
+        //======================================================
+        // 7. CALCULAR LA CONTRIBUCION DE LA MUESTRA:
+        // donde: Esta expresión corresponde al estimador de iluminación directa por muestreo uniforme del área de una fuente luminosa esférica.
+        //======================================================
+
+        // BRDF de Lambert:
+        // f_r = albedo / PI
+        Color brdf = obj.c * (1.0 / PI);
+
+        // Factores geometricos: es el factor geometrico entre las dos superficies
+        // cos(theta_surface) * cos(theta_light) / distancia^2
+        // coseno receptor * coseno emisor / distancia^2.
+        double geometry =
+            (cosSurface * cosLight) /
+            (distance * distance);
+
+        // Estimador de Monte Carlo para muestreo uniforme
+        // sobre el area de la fuente luminosa:
+        //
+        // contribucion =
+        // BRDF * radiancia * geometria / PDF_area
+
+        Color contribution =
+            brdf.mult(lightEmission) *
+            (geometry / pdfArea);
+
+        // Acumular la contribucion visible
+        // Sumar la contribucion de la muestra al resultado acumulado.
+        accumulated = accumulated + contribution;
+    }
+
+    //==========================================================
+    // 8. PROMEDIO DE MONTE CARLO
+    //==========================================================
+
+    Color result = accumulated * (1.0 / SAMPLES); // se promedio la acumulacion entre las muestras de las contribuciones
+
+    // Limitar los valores para la imagen final
+    // Limitar los canales RGB para la representacion final de la imagen.
+    result.x = clamp(result.x);
+    result.y = clamp(result.y);
+    result.z = clamp(result.z);
+
+    return result;
+
+}
+
+int main(int argc, char *argv[]) {
+	int w = 1024, h = 768; // image resolution
+  
+	// fija la posicion de la camara y la dirección en que mira
+	Ray camera( Point(0, 11.2, 214), Vector(0, -0.042612, -1).normalize() );
+	
+
+	// parametros de la camara
+	//son vectores auxiliares que definen los ejes horizontal y vertical del plano de imagen. El producto cruz ayuda a obtener una dirección perpendicular.
+	Vector cx = Vector( w * 0.5095 / h, 0., 0.); 
+	Vector cy = (cx % camera.d).normalize() * 0.5095;
+
+	// auxiliar para valor de pixel y matriz para almacenar la imagen
+	// en pocas palabras, se reserva memoria dinamica para almacenar los colores por cada pixel de la imagen.
+	Color *pixelColors = new Color[w * h];
+
+	// PROYECTO 2: usar openmp para paralelizar el ciclo: cada hilo computara un renglon (ciclo interior),
+	/*
+	El código utiliza OpenMP para distribuir el procesamiento de los renglones de la imagen entre varios hilos.
+Cada hilo crea su propio generador std::mt19937 utilizando una semilla dependiente de
+omp_get_thread_num(). Esto evita compartir el generador aleatorio entre hilos y reduce problemas de
+concurrencia.
+	*/
+	#pragma omp parallel // para crear una region paralela.
+	{
+		std::mt19937 gen(1234 + omp_get_thread_num() * 7919);
+		std::uniform_real_distribution<double> dis(0.0,1.0);
+		// PROYECTO 1
+		// usar openmp para paralelizar el ciclo: cada hilo computara un renglon (ciclo interior),
+        // el pragma omp for schedule(dynamic) sirve para distribuir los renglones entre los hilos de esa región.
+		#pragma omp for schedule(dynamic)
+		for(int y = 0; y < h; y++) 
+		{ 
+			// recorre todos los pixeles de la imagen
+			fprintf(stderr,"\r%5.2f%%",100.*y/(h-1));
+			for(int x = 0; x < w; x++ ) {
+				//convierte las coordenadas 2D en una posición del arreglo lineal y además invierte verticalmente la imagen para el formato de salida.
+				int idx = (h - y - 1) * w + x; // index en 1D para una imagen 2D x,y son invertidos
+				Color pixelValue = Color(); // pixelValue en negro por ahora
+				// para el pixel actual, computar la dirección que un rayo debe tener
+				// se construye cameraRayDir combinando la posición horizontal, vertical y dirección de la cámara. Luego se normaliza.
+				Vector cameraRayDir = cx * ( double(x)/w - .5) + cy * ( double(y)/h - .5) + camera.d;
+			
+				// computar el color del pixel para el punto que intersectó el rayo desde la camara
+				pixelValue = shade( Ray(camera.o, cameraRayDir.normalize()) ,gen,dis);
+
+				// limitar los tres valores de color del pixel a [0,1]
+				pixelColors[idx] = Color(clamp(pixelValue.x), clamp(pixelValue.y), clamp(pixelValue.z));
+			}
+		}
+
+	}
+	
+	fprintf(stderr,"\n");
+
+	// PROYECTO 1
+	// Investigar formato ppm
+	FILE *f = fopen("image.ppm", "w");
+	// escribe cabecera del archivo ppm, ancho, alto y valor maximo de color
+	fprintf(f, "P3\n%d %d\n%d\n", w, h, 255); 
+	for (int p = 0; p < w * h; p++) 
+	{ // escribe todos los valores de los pixeles
+    		fprintf(f,"%d %d %d ", toDisplayValue(pixelColors[p].x), toDisplayValue(pixelColors[p].y), 
+				toDisplayValue(pixelColors[p].z));
+  	}
+  	fclose(f);
+
+  	delete[] pixelColors;
+
+	return 0;
+}
+
+
+
